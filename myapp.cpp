@@ -1,123 +1,27 @@
+// g++ -std=c++17 myapp.cpp -o myapp -pthread
 #include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
 #include <thread>
 #include <atomic>
 #include <csignal>
-#include <chrono>
-#include <ctime>
+#include <sys/eventfd.h>
 #include <unistd.h>
+#include <sys/epoll.h>
 
 using namespace std;
 
-// ===================== LOG (PID FILE) =====================
-static ofstream g_log;
-
-void log(const string& msg) {
-    g_log << msg << endl;
-    g_log.flush();
-}
-
-// ===================== TIME WINDOW =====================
-struct Window {
-    int start; // minutes
-    int end;
-};
-
-// 当前时间（分钟）
-int nowMin() {
-    time_t t = time(nullptr);
-    tm* lt = localtime(&t);
-    return lt->tm_hour * 60 + lt->tm_min;
-}
-
-// HH:MM -> minutes
-int toMin(const string& s) {
-    int h = stoi(s.substr(0,2));
-    int m = stoi(s.substr(3,2));
-    return h * 60 + m;
-}
-
-// 解析配置
-vector<Window> parseWindows(const string& line) {
-    vector<Window> ws;
-
-    auto pos = line.find('=');
-    string s = (pos != string::npos) ? line.substr(pos + 1) : line;
-
-    string item;
-    stringstream ss(s);
-
-    while (getline(ss, item, ',')) {
-        auto dash = item.find('-');
-        if (dash == string::npos) continue;
-
-        string a = item.substr(0, dash);
-        string b = item.substr(dash + 1);
-
-        ws.push_back({toMin(a), toMin(b)});
-    }
-
-    return ws;
-}
-
-// 判断是否在窗口（支持跨天）
-bool inWindow(const vector<Window>& ws) {
-    int now = nowMin();
-
-    for (auto& w : ws) {
-
-        // ===== 正常区间 =====
-        if (w.start <= w.end) {
-            if (now >= w.start && now <= w.end)
-                return true;
-        }
-
-        // ===== 跨天区间 =====
-        else {
-            // 22:00-02:00
-            if (now >= w.start || now <= w.end)
-                return true;
-        }
-    }
-
-    return false;
-}
-
-// 读取配置
-vector<Window> loadWindows(const string& path) {
-
-    ifstream f(path);
-    string line;
-
-    while (getline(f, line)) {
-        if (line.find("WINDOWS=") == 0)
-            return parseWindows(line);
-    }
-
-    return {};
-}
-
-// ===================== WORKER =====================
+// ===================== worker =====================
 void worker_main(atomic<bool>& running) {
-
-    log("[worker] started");
+    cout << "[worker] started\n";
 
     while (running) {
-
-        log("[worker] running... tick every 10 seconds");
-
-        for (int i = 0; i < 10; i++) {
-            if (!running) break;
-            this_thread::sleep_for(chrono::seconds(1));
-        }
+        cout << "[worker] running...\n";
+        sleep(10);
     }
 
-    log("[worker] stopped");
+    cout << "[worker] stopped\n";
 }
 
-// ===================== WORKER WRAPPER =====================
+// ===================== worker wrapper =====================
 class Worker {
 public:
     atomic<bool> running{false};
@@ -127,114 +31,108 @@ public:
         if (running) return;
 
         running = true;
-
         th = thread([this]() {
             worker_main(running);
         });
 
-        log("[daemon] worker started");
+        cout << "[daemon] worker started\n";
     }
 
     void stop() {
         if (!running) return;
 
         running = false;
+        if (th.joinable()) th.join();
 
-        if (th.joinable())
-            th.join();
-
-        log("[daemon] worker stopped");
-    }
-
-    bool isRunning() {
-        return running;
+        cout << "[daemon] worker stopped\n";
     }
 };
 
 Worker worker;
 
-// ===================== SIGNAL =====================
-atomic<bool> g_exit{false};
-atomic<bool> g_start{false};
-atomic<bool> g_stop{false};
+// ===================== eventfd =====================
+int efd;
 
-void handle(int sig) {
-    if (sig == SIGTERM || sig == SIGINT)
-        g_exit = true;
+// ===================== signal flags =====================
+enum Action {
+    ACT_START = 1,
+    ACT_STOP  = 2,
+    ACT_EXIT  = 3
+};
 
-    if (sig == SIGUSR1)
-        g_start = true;
-
-    if (sig == SIGUSR2)
-        g_stop = true;
+// 写 eventfd
+void notify(Action a) {
+    uint64_t v = a;
+    write(efd, &v, sizeof(v));
 }
 
-// ===================== DAEMON LOOP =====================
-void daemon_loop() {
+// signal handler（只做写 eventfd）
+void handle(int sig) {
+    if (sig == SIGUSR1) notify(ACT_START);
+    if (sig == SIGUSR2) notify(ACT_STOP);
+    if (sig == SIGTERM) notify(ACT_EXIT);
+}
 
-    const string cfgPath = "/etc/myapp/windows.cfg";
+// ===================== daemon loop =====================
+void loop() {
 
-    while (!g_exit) {
+    int ep = epoll_create1(0);
 
-        // ===== signal start =====
-        if (g_start) {
-            log("[signal] force start worker");
-            worker.start();
-            g_start = false;
-        }
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = efd;
 
-        // ===== signal stop =====
-        if (g_stop) {
-            log("[signal] force stop worker");
-            worker.stop();
-            g_stop = false;
-        }
+    epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev);
 
-        // ===== reload config =====
-        vector<Window> windows = loadWindows(cfgPath);
+    while (true) {
 
-        // ===== time window control =====
-        if (inWindow(windows)) {
-            if (!worker.isRunning())
+        epoll_event events[1];
+
+        // 阻塞等待事件（无 polling）
+        int n = epoll_wait(ep, events, 1, -1);
+
+        if (n > 0) {
+
+            uint64_t msg;
+            read(efd, &msg, sizeof(msg));
+
+            if (msg == ACT_START) {
+                cout << "[signal] START\n";
                 worker.start();
-        } else {
-            if (worker.isRunning())
-                worker.stop();
-        }
+            }
 
-        this_thread::sleep_for(chrono::seconds(1));
+            else if (msg == ACT_STOP) {
+                cout << "[signal] STOP\n";
+                worker.stop();
+            }
+
+            else if (msg == ACT_EXIT) {
+                cout << "[signal] EXIT\n";
+                worker.stop();
+                break;
+            }
+        }
     }
 
-    log("[daemon] exiting...");
-    worker.stop();
+    close(ep);
 }
 
-// ===================== MAIN =====================
+// ===================== main =====================
 int main() {
 
-    // ===== PID LOG =====
-    pid_t pid = getpid();
-    string path = "/tmp/myapp_" + to_string(pid) + ".log";
+    efd = eventfd(0, EFD_NONBLOCK);
 
-    g_log.open(path, ios::app);
-
-    if (!g_log.is_open()) {
-        cerr << "cannot open log file\n";
-        return 1;
-    }
-
-    log("[daemon] started");
-
-    // ===== signals =====
-    signal(SIGINT, handle);
-    signal(SIGTERM, handle);
     signal(SIGUSR1, handle);
     signal(SIGUSR2, handle);
+    signal(SIGTERM, handle);
 
-    // ===== run =====
-    daemon_loop();
+    cout << "[daemon] started\n";
 
-    log("[daemon] stopped");
+    loop();
+
+    cout << "[daemon] exited\n";
+    close(efd);
 
     return 0;
 }
+
